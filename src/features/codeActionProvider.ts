@@ -17,13 +17,18 @@ import { LanguageMiddlewareFeature } from '../omnisharp/LanguageMiddlewareFeatur
 
 export default class CodeActionProvider extends AbstractProvider implements vscode.CodeActionProvider {
 
-    private _commandId: string;
+    private _resolveCodeActionCommandId: string;
+    private _runCodeActionCommandId: string;
 
     constructor(server: OmniSharpServer, private optionProvider: OptionProvider, languageMiddlewareFeature: LanguageMiddlewareFeature) {
         super(server, languageMiddlewareFeature);
-        this._commandId = 'omnisharp.runCodeAction';
-        let registerCommandDisposable = vscode.commands.registerCommand(this._commandId, this._runCodeAction, this);
-        this.addDisposables(new CompositeDisposable(registerCommandDisposable));
+        this._resolveCodeActionCommandId = 'omnisharp.resolveCodeAction';
+        let registerResolveCodeActionCommandDisposable = vscode.commands.registerCommand(this._resolveCodeActionCommandId, this._resolveCodeAction, this);
+        this.addDisposables(new CompositeDisposable(registerResolveCodeActionCommandDisposable));
+
+        this._runCodeActionCommandId = 'omnisharp.runCodeAction';
+        let registerRunCodeActionCommandDisposable = vscode.commands.registerCommand(this._runCodeActionCommandId, this._runCodeAction, this);
+        this.addDisposables(new CompositeDisposable(registerRunCodeActionCommandDisposable));
     }
 
     public async provideCodeActions(document: vscode.TextDocument, range: vscode.Range, context: vscode.CodeActionContext, token: vscode.CancellationToken): Promise<vscode.Command[]> {
@@ -89,7 +94,7 @@ export default class CodeActionProvider extends AbstractProvider implements vsco
 
                 return {
                     title: codeAction.Name,
-                    command: this._commandId,
+                    command: this._runCodeActionCommandId,
                     arguments: [runRequest, token]
                 };
             });
@@ -99,8 +104,59 @@ export default class CodeActionProvider extends AbstractProvider implements vsco
         }
     }
 
-    private async _runCodeAction(req: protocol.V2.RunCodeActionRequest, token: vscode.CancellationToken): Promise<boolean | string | {}> {
+    private async _resolveCodeAction(req: protocol.V2.RunCodeActionRequest, token: vscode.CancellationToken): Promise<vscode.WorkspaceEdit> {
 
+        return serverUtils.runCodeAction(this._server, req).then(async response => {
+            if (response && Array.isArray(response.Changes)) {
+
+                let edit = new vscode.WorkspaceEdit();
+                let renamedFiles: Uri[] = [];
+
+                for (let change of response.Changes) {
+                    if (change.ModificationType == FileModificationType.Renamed)
+                    {
+                        // The file was renamed. Omnisharp has already persisted
+                        // the right changes to disk. We don't need to try to
+                        // apply text changes (and will skip this file if we see an edit)
+                        renamedFiles.push(Uri.file(change.FileName));
+                    }
+                }
+
+                for (let change of response.Changes) {
+                    if (change.ModificationType == FileModificationType.Opened)
+                    {
+                        // The CodeAction requested that we open a file.
+                        // Not supported for a WorkspaceEdit, skipping
+                        continue;
+                    }
+
+                    if (change.ModificationType == FileModificationType.Modified)
+                    {
+                        let uri = vscode.Uri.file(change.FileName);
+                        if (renamedFiles.some(r => r == uri))
+                        {
+                            // This file got renamed. OmniSharp has already
+                            // persisted the new file with any applicable changes.
+                            continue;
+                        }
+
+                        let edits: vscode.TextEdit[] = [];
+                        for (let textChange of change.Changes) {
+                            edits.push(vscode.TextEdit.replace(toRange2(textChange), textChange.NewText));
+                        }
+
+                        edit.set(uri, edits);
+                    }
+                }
+
+                return edit;
+            }
+        }, async (error) => {
+            return Promise.reject(`Problem invoking 'ResolveCodeAction' on OmniSharp server: ${error}`);
+        });
+    }
+
+    private async _runCodeAction(req: protocol.V2.RunCodeActionRequest, token: vscode.CancellationToken): Promise<boolean | string | {}> {
         return serverUtils.runCodeAction(this._server, req).then(async response => {
             if (response && Array.isArray(response.Changes)) {
 
@@ -172,8 +228,8 @@ export default class CodeActionProvider extends AbstractProvider implements vsco
                             return vscode.commands.executeCommand("vscode.open", fileToOpen);
                         })
                  : next;
-                }
-            }, async (error) => {
+            }
+        }, async (error) => {
             return Promise.reject(`Problem invoking 'RunCodeAction' on OmniSharp server: ${error}`);
         });
     }
